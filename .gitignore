@@ -1,0 +1,44 @@
+# Claude Code local, per-machine settings
+**/.claude/settings.local.json
+**/.claude/worktrees/
+
+# Go
+*.exe
+*.test
+*.out
+coverage.*
+/bin/
+/dist/
+
+# Local env
+.env
+.env.local
+
+# The built binary
+/wpstaging
+
+# Runtime config naming real environments: docroots, database DSNs, credentials
+# for the live site. Deliberately untracked -- the tool is committed, the
+# identity of the server it operates on is not. wpstaging.example.toml is the
+# committed template.
+wpstaging.toml
+wpstaging.*.toml
+!wpstaging.example.toml
+
+# The state store. Content-addressed chunks of a real WordPress site: uploads,
+# database dumps, and wp-config.php with its credentials and salts. This
+# repository is public and a store one `git add -A` away from being published is
+# the worst outcome this project can produce.
+/store/
+*.tar.zst
+*.age
+
+# State index and SQLite's write-ahead log and shared-memory sidecars
+wpstaging.db
+wpstaging.db-wal
+wpstaging.db-shm
+*.tmp
+
+# Throwaway WordPress fixture built by the integration tests -- a full WordPress
+# tree, downloaded not authored.
+/testdata/fixture/
