@@ -21,11 +21,44 @@
 
 set -u
 
+# Server binaries live in sbin, which is not on an unprivileged user's PATH on
+# Debian. Without this the whole web-server section comes back empty and reads
+# as "no Apache installed", which is a much more alarming answer than the truth.
+PATH="$PATH:/usr/sbin:/sbin:/usr/local/sbin"
+
 WP_PATH="${1:-}"
 
 say()  { printf '\n== %s ==\n' "$1"; }
 item() { printf '%-34s %s\n' "$1" "$2"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# find_wordpress looks in the usual places. Passing the path is still better,
+# but a run that silently skips two thirds of its checks because an argument was
+# omitted is a bad way to find that out.
+find_wordpress() {
+	local c
+	for c in \
+		"$HOME/public_html" "$HOME/www" "$HOME/htdocs" \
+		"$HOME"/*/public_html "$HOME"/*/httpdocs "$HOME"/*/htdocs \
+		/var/www/html /var/www/*/public_html /var/www/*/htdocs /var/www/*
+	do
+		[ -r "$c/wp-config.php" ] && { echo "$c"; return 0; }
+	done
+
+	# Last resort: walk the home directory. Bounded depth so this stays quick.
+	c="$(find "$HOME" -maxdepth 5 -name wp-config.php -readable 2>/dev/null | head -1)"
+	[ -n "$c" ] && { dirname "$c"; return 0; }
+
+	return 1
+}
+
+if [ -z "$WP_PATH" ]; then
+	if WP_PATH="$(find_wordpress)"; then
+		printf 'No path given; found WordPress at %s\n' "$WP_PATH"
+	else
+		WP_PATH=""
+	fi
+fi
 
 # run_sql executes a query and prints the result, using whatever route works.
 # wp-cli is preferred because it reads wp-config.php itself and no credential
@@ -47,6 +80,23 @@ run_sql() {
 }
 
 printf 'wpstaging recon -- %s on %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(hostname 2>/dev/null || echo unknown)"
+
+if [ -z "$WP_PATH" ] || [ ! -d "$WP_PATH" ]; then
+	cat <<'WARN'
+
+!! ---------------------------------------------------------------------- !!
+!! No WordPress installation was given or found.                          !!
+!!                                                                        !!
+!! Everything that decides the design -- database privileges, which        !!
+!! tables production writes, site size, whether the docroot can be         !!
+!! swapped -- needs it. The run below will still print the host survey,    !!
+!! but the important half will be missing.                                 !!
+!!                                                                        !!
+!!   ./recon.sh /path/to/wordpress                                         !!
+!! ---------------------------------------------------------------------- !!
+
+WARN
+fi
 
 # ---------------------------------------------------------------- the machine
 
@@ -72,6 +122,23 @@ if have systemctl; then
 	item "lingering enabled"      "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || echo '?')"
 fi
 
+# With no root and no user systemd, something else has to start the UI at boot
+# and restart it if it dies. cron's @reboot is the usual unprivileged answer.
+say "Keeping a process alive"
+if have crontab; then
+	if crontab -l >/dev/null 2>&1; then
+		item "crontab" "usable ($(crontab -l 2>/dev/null | grep -cvE '^\s*(#|$)') entries)"
+		item "@reboot supported" "$(crontab -l 2>/dev/null | grep -c '@reboot') existing @reboot entries"
+	else
+		item "crontab" "present but 'crontab -l' failed -- may be denied to this user"
+	fi
+else
+	item "crontab" "absent"
+fi
+item "tmux / screen" "$( { have tmux && echo -n 'tmux '; } ; { have screen && echo -n screen; } ; echo)"
+item "nohup" "$(have nohup && echo present || echo absent)"
+item "ulimit -u (max procs)" "$(ulimit -u 2>/dev/null)"
+
 # A control panel usually means vhosts and databases are created through it
 # rather than by hand, which is a different integration entirely.
 say "Control panel"
@@ -91,12 +158,38 @@ if have apache2ctl || have apachectl; then
 	APACHECTL="$(have apache2ctl && echo apache2ctl || echo apachectl)"
 	# Needed to put the Go UI behind Apache with TLS terminated there.
 	mods="$($APACHECTL -M 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
-	for m in proxy_module proxy_http_module ssl_module headers_module rewrite_module; do
+	for m in proxy_module proxy_http_module ssl_module headers_module rewrite_module authn_file_module auth_basic_module md_module; do
 		case " $mods " in
 			*" $m "*) item "mod ${m%_module}" "present" ;;
 			*)        item "mod ${m%_module}" "ABSENT or not listable unprivileged" ;;
 		esac
 	done
+fi
+
+# Who owns the vhosts decides how the two subdomains get created, and whether
+# the Go UI can be proxied without asking someone with root.
+say "Apache configuration"
+for d in /etc/apache2/sites-enabled /etc/apache2/vhosts.d /etc/httpd/conf.d /etc/apache2/conf.d; do
+	if [ -d "$d" ]; then
+		item "$d" "$( [ -r "$d" ] && echo "readable, $(ls -1 "$d" 2>/dev/null | wc -l) files" || echo 'present but not readable' )"
+		[ -r "$d" ] && ls -1 "$d" 2>/dev/null | sed 's/^/    /'
+	fi
+done
+item "can write vhost dir" "$( { [ -w /etc/apache2/sites-enabled ] || [ -w /etc/httpd/conf.d ]; } 2>/dev/null && echo yes || echo 'no -- subdomains need the server admin' )"
+
+# .htaccess is the unprivileged lever: if AllowOverride permits it, basic auth
+# and the ACME exemption can be arranged without touching a vhost.
+if [ -n "$WP_PATH" ] && [ -r "$WP_PATH/.htaccess" ]; then
+	item ".htaccess" "present, $(wc -l < "$WP_PATH/.htaccess") lines"
+fi
+
+say "Listening ports"
+if have ss; then
+	ss -ltn 2>/dev/null | awk 'NR==1 || $4 ~ /:(80|443|3306|8[0-9]{3})$/'
+elif have netstat; then
+	netstat -ltn 2>/dev/null | head -20
+else
+	echo "(neither ss nor netstat available)"
 fi
 
 say "PHP"
@@ -167,10 +260,14 @@ elif [ -x "$HOME/bin/wp" ]; then
 	WP_CLI="$HOME/bin/wp"
 fi
 
+[ -z "$WP_CLI" ] && [ -x "$HOME/wp-cli.phar" ] && WP_CLI="php $HOME/wp-cli.phar"
+
 if [ -n "$WP_CLI" ]; then
 	item "wp-cli" "$($WP_CLI --version 2>/dev/null | head -1)"
 else
-	item "wp-cli" "absent"
+	item "wp-cli" "absent -- it is a single phar and needs no privileges:"
+	echo '        curl -sLO https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar'
+	echo '        php wp-cli.phar --info      # then re-run this script'
 fi
 
 MYSQL_CNF=""
