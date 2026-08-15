@@ -60,9 +60,33 @@ vuln-check: ## Check dependencies against the Go vulnerability database (needs n
 test-unit: ## Run unit tests
 	$(GO) test ./...
 
+# Integration tests need a real MySQL/MariaDB, because the properties under
+# test -- byte-identical dumps, exact round trips through every column type --
+# are properties of a server's behaviour and a fake would only test the fake.
+TEST_DB_IMAGE ?= mariadb:10.11
+TEST_DB_PORT  ?= 13306
+TEST_DSN      ?= root:test@tcp(127.0.0.1:$(TEST_DB_PORT))/wptest
+
+.PHONY: test-db
+test-db: ## Start a throwaway MariaDB for the integration tests
+	docker rm -f wpstg-test 2>/dev/null || true
+	docker run -d --name wpstg-test \
+		-e MARIADB_ROOT_PASSWORD=test -e MARIADB_DATABASE=wptest \
+		-p $(TEST_DB_PORT):3306 $(TEST_DB_IMAGE)
+	@echo "waiting for the server to accept connections..."
+	@for i in $$(seq 1 60); do \
+		docker exec wpstg-test mariadb -uroot -ptest -e 'SELECT 1' >/dev/null 2>&1 && break; \
+		sleep 1; \
+	done
+	@echo "ready: WPSTAGING_TEST_DSN='$(TEST_DSN)'"
+
+.PHONY: test-db-stop
+test-db-stop: ## Remove the throwaway database server
+	docker rm -f wpstg-test 2>/dev/null || true
+
 .PHONY: test-integration
-test-integration: ## Run integration tests against the throwaway WordPress fixture
-	$(GO) test -tags=integration ./...
+test-integration: ## Run integration tests (needs `make test-db` first)
+	WPSTAGING_TEST_DSN='$(TEST_DSN)' $(GO) test -tags=integration ./...
 
 .PHONY: test
 test: test-unit lint vuln-check ## Full check: unit tests + lint + vulnerability scan
