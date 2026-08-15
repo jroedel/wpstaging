@@ -107,6 +107,31 @@ share an ancestor — which holds for this workflow, where staging is always a
 recent copy of production, and stops holding if a staging environment is kept
 alive for months while production moves on.
 
+### Where whole-table authority runs out
+
+There is a case it cannot cover, and the site this was built for has it.
+
+WordPress does not give every kind of record its own table. A contact-form
+archive (`flamingo_inbound`), a WooCommerce order (`shop_order`), an event
+(`tribe_events`) — these are not tables. They are `post_type` values, and they
+are **rows in `wp_posts`**, alongside the pages and posts you went to staging to
+edit.
+
+So there is no table-level split that keeps production's new form submissions
+while taking staging's rewritten pages. They are rows in one table, and choosing
+that table means choosing one and discarding the other.
+
+Row-level authority scoped by `post_type` would solve it, and it is a genuinely
+harder problem than it looks: rows created on both sides claim overlapping
+auto-increment ids, so carrying production's rows across means renumbering them
+and rewriting every reference — `wp_postmeta.post_id`,
+`wp_woocommerce_order_items.order_id`, and whatever a plugin invented. That is
+the road with the wreckage on it. It is not ruled out forever, but it will not
+be attempted casually, and it is not in v1.
+
+What v1 does instead is refuse to put you in that position by default. See
+below.
+
 ## Concepts
 
 ### State
@@ -278,11 +303,49 @@ part of the transaction**, not left as a checklist:
 These are per-environment flags. The production environment declares none of
 them, and the tool refuses to apply them there.
 
-## Promotion and the content freeze
+## Promotion: the database is live, the files are code
 
-`wpstaging promote <state>` deploys a state to production using exactly the
-machinery above. Two things happen around it that do not happen on a staging
-deploy:
+The instinct is that promoting means moving the whole state back. For a site
+with any life in it, that instinct is wrong, and the recon of the site this was
+built for shows why: nearly ten thousand archived contact-form submissions, a
+WooCommerce order history, a comment stream, and a background job queue — all of
+it written by production, continuously, while you work on staging.
+
+Meanwhile the changes you actually went to staging to make — a plugin updated, a
+theme rewritten, a legacy page template deleted, custom CSS — are **files**.
+
+So promotion is tiered, and the default moves no data at all:
+
+```
+wpstaging promote <state>                    files only; the database is untouched
+wpstaging promote <state> --options a,b,c    files, plus named wp_options rows
+wpstaging promote <state> --full             everything, with preserve lists and a freeze
+```
+
+**`promote` (files only) is the safe default and covers most of the work.**
+Deploying a plugin's files to production is exactly what updating that plugin
+normally does; WordPress notices the version change and runs the plugin's own
+upgrade routine, the same as it would have. Nothing production wrote can be
+lost, because nothing production wrote is touched. Rollback is a symlink flip.
+
+**`--options`** carries named settings rows across for the case where the change
+you tested *was* a setting. Named explicitly, one at a time, never wholesale:
+`wp_options` also holds transients and cron state, and copying it entire would
+drag a staging site's scheduled jobs onto production.
+
+**`--full`** is the whole-state promotion described above, with preserved tables
+and a content freeze. On a site like this one it will discard everything
+production accumulated outside the preserved tables, so it demands explicit
+confirmation and prints exactly what it is about to lose. It is the right tool
+for a rebuild and the wrong tool for a Tuesday.
+
+This is not a limitation being apologised for. It is how every mature deployment
+system works: code moves forward, data does not.
+
+## The content freeze, when you do promote in full
+
+`--full` deploys a whole state to production using exactly the machinery above.
+Two things happen around it that do not happen on a staging deploy:
 
 - **Production is snapshotted first, automatically.** The pre-promotion state is
   captured and labelled before anything moves, so "undo the promotion" is always
@@ -311,7 +374,9 @@ wpstaging show <state>                      manifest and contents of a state
 wpstaging diff <state-a> <state-b>          what changed: files, plugins, schema
 
 wpstaging deploy <state> --to staging       materialize and swap
-wpstaging promote <state>                   deploy to production, with guards
+wpstaging promote <state>                   files only; production's data untouched
+wpstaging promote <state> --options a,b     files, plus named wp_options rows
+wpstaging promote <state> --full            everything, with preserves and a freeze
 wpstaging rollback <env>                    flip back to the previous release
 
 wpstaging export <state> --out FILE.age     portable archive, encrypted
@@ -331,33 +396,51 @@ any other admin surface.
 ## Running it on the server
 
 Three names on one host: the live site, a staging subdomain, and a subdomain
-serving this tool's UI. Apache terminates TLS for all three and proxies the last
-one to the Go process on loopback.
+serving this tool's UI. Apache terminates TLS for all three.
+
+```
+browser ──HTTPS──▶ Apache (panel-issued cert) ──.htaccess [P]──▶ 127.0.0.1:PORT ──▶ wpstaging
+```
+
+**The whole of this runs without root**, which is not a compromise but the
+target: the reference deployment is a Hetzner konsoleH account where nobody has
+root and the panel owns domains, DNS, certificates and document roots. That
+constraint is worth designing to even where root is available, because it is the
+common case for the sites that need this tool most.
+
+- **The proxy lives in `.htaccess`.** `ProxyPass` is illegal there; the working
+  form is `RewriteRule … [P]`, which `mod_proxy` supports for exactly this.
+- **Supervision is cron.** Where `systemctl --user` is unavailable — no user
+  D-Bus, no lingering — an `@reboot` entry plus an idempotent five-minute
+  watchdog keeps the process up. Detached processes do survive an SSH
+  disconnect.
+- **The binary binds `127.0.0.1` and never opens a public port.** It never
+  speaks TLS and never sits inside a document root.
 
 The management UI is the most dangerous surface on the machine — more so than
 `wp-admin`, which can edit a page, where this can replace the database — so it
-gets two independent locks: HTTP authentication at Apache, and the binary's own
-session on top. One misplaced directive in a vhost then costs you a layer rather
-than the site. The process binds to `127.0.0.1` and is never reachable except
-through the proxy.
+gets two independent locks: HTTP authentication at the proxy, and the binary's
+own session on top. One misplaced directive then costs a layer rather than the
+site.
 
 Two things that bite:
 
 - **Exempt `/.well-known/acme-challenge/` from authentication.** ACME validation
-  is an unauthenticated GET. Put HTTP auth across `/` on a vhost and certificate
-  renewal fails silently — sixty days later, quite far from the change that
-  caused it.
+  is an unauthenticated GET. Put HTTP auth across `/` and certificate renewal
+  fails silently — sixty days later, quite far from the change that caused it.
 - **A shared PHP-FPM pool means staging can take production down.** Separate
-  pools are the fix and they need root. Without it, staging competes for the same
-  workers as the live site, and the mitigations are to keep the safety measures
-  on (`no-cron` especially, since a doubled scheduler is the usual way a staging
-  copy starts consuming real resources) and to remember that a heavy import on
-  staging is felt by real visitors.
+  pools need root and are usually unavailable. Without them, staging competes
+  for the same workers as the live site, so keep the safety measures on
+  (`no-cron` especially — a doubled scheduler is the usual way a staging copy
+  starts consuming real resources) and remember that a heavy import on staging
+  is felt by real visitors.
 
 `deploy/recon.sh` surveys a host and reports which of the assumptions above hold
 on it — opcode cache settings, database privileges, whether a long-lived process
 can be kept alive, and which tables production actually writes. It reads and
-prints; it changes nothing and needs no root. Run it before writing any config.
+prints; it changes nothing, needs no root, and redacts credentials. Run it
+before writing any config. `production_recon.md` records what it found for the
+reference deployment.
 
 ## Layout
 
@@ -400,8 +483,9 @@ still builds with no C toolchain.
 - Content-addressed deduplicated store with deterministic database dumps
 - Deploy to staging on the same host, atomic swap, per-release table prefix
 - All five staging safety measures
-- Promote to production with automatic pre-snapshot and drift reporting
-- Preserved tables, so production's comments survive a promotion
+- Tiered promotion: files-only by default, named options, or full state
+- Automatic pre-promotion snapshot and drift reporting
+- Preserved tables, so production's comments survive a full promotion
 - Rollback
 - Runs unprivileged: no root, no systemctl, no vhost edits at deploy time
 - Web UI over all of it
@@ -411,6 +495,9 @@ still builds with no C toolchain.
 
 - Database diffing or merging, in any form — see above. Preserved tables are
   whole-table authority, which is a different thing and the only thing offered.
+- Row-level authority scoped by `post_type`, which is what carrying production's
+  form submissions and orders across a full promotion would need. Understood,
+  wanted, and deliberately not attempted in v1.
 - Multisite
 - Remote hosts, SSH, cloud storage back-ends
 - PostgreSQL, SQLite-backed WordPress
