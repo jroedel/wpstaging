@@ -126,12 +126,17 @@ fi
 # and restart it if it dies. cron's @reboot is the usual unprivileged answer.
 say "Keeping a process alive"
 if have crontab; then
-	if crontab -l >/dev/null 2>&1; then
-		item "crontab" "usable ($(crontab -l 2>/dev/null | grep -cvE '^\s*(#|$)') entries)"
-		item "@reboot supported" "$(crontab -l 2>/dev/null | grep -c '@reboot') existing @reboot entries"
-	else
-		item "crontab" "present but 'crontab -l' failed -- may be denied to this user"
-	fi
+	# `crontab -l` exits non-zero for an empty crontab as well as for a denied
+	# one, and reporting "may be denied" for an account that simply has no jobs
+	# yet sends you chasing a restriction that was never there. The message
+	# tells the two apart.
+	cronout="$(crontab -l 2>&1)"
+	case "$?:$cronout" in
+		0:*)          item "crontab" "usable ($(printf '%s\n' "$cronout" | grep -cvE '^\s*(#|$)') entries)"
+		              item "@reboot entries" "$(printf '%s\n' "$cronout" | grep -c '@reboot')" ;;
+		*no\ crontab*) item "crontab" "usable, currently empty" ;;
+		*)            item "crontab" "DENIED or failing: $(printf '%s' "$cronout" | head -1)" ;;
+	esac
 else
 	item "crontab" "absent"
 fi
@@ -314,8 +319,11 @@ item "table prefix" "$PREFIX"
 # release gets its own schema. Without, each release gets its own table prefix
 # inside the one database -- same atomicity, fewer privileges.
 say "Database privileges"
-echo "Looking for CREATE, DROP, and whether they extend to whole databases:"
-run_sql 'SHOW GRANTS FOR CURRENT_USER();'
+echo "Looking for CREATE, DROP, and whether they extend to whole databases."
+echo "Password hashes are redacted: SHOW GRANTS prints IDENTIFIED BY PASSWORD,"
+echo "and a mysql_native_password hash is SHA1(SHA1(password)) -- crackable"
+echo "offline for anything short. It has no business in a file you paste around."
+run_sql 'SHOW GRANTS FOR CURRENT_USER();' | sed -E "s/IDENTIFIED BY PASSWORD '[^']*'/IDENTIFIED BY PASSWORD '<redacted>'/g"
 
 # ------------------------------------------------------ what production writes
 
